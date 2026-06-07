@@ -21,9 +21,12 @@ import (
 
 var relayRecordDropCount int64
 
-// 请求体/响应体各自的捕获上限。固定 1MB:覆盖绝大多数对话内容,
-// 同时给在途 buffer 和落库记录一个硬性内存上界。
-const relayRecordMaxBodyBytes = 1 << 20
+// 请求体/响应体各自的捕获上限。
+// 长上下文轨迹(多轮 agent 会话)的请求体携带完整历史,100K-200K token
+// 上下文约 0.5-1.2MB JSON,含截图(base64)可达数 MB —— 这些恰恰是
+// 最有价值的记录,上限过低会正好截断它们(truncated 记录下游只能废弃)。
+// 16MB 覆盖满上下文 + 多张截图;内存安全由 model 侧的队列字节预算兜底。
+const relayRecordMaxBodyBytes = 16 << 20
 
 // captureWriter 包装 gin.ResponseWriter,在透传写入的同时把响应体
 // 复制进内存 buffer(有上限)。嵌入接口使 Status()/Size()/Written()/

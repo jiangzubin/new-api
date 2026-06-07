@@ -62,18 +62,24 @@ const (
 )
 
 // 写入流水线参数。固定值,经过验证的安全默认:
-//   - 批 50 条 / 单条 INSERT 3MB 预算(< MySQL 5.7 max_allowed_packet 4MB)/ 3 秒必 flush
-//   - 队列 5000 条、Stream 上限 10000 条:字节上界 ≈ 条数 × 2MB(请求+响应体各 1MB 上限),
-//     正常载荷(每条几十 KB)下为数百 MB
+//   - 批 50 条 / 单条 INSERT 3MB 预算 / 3 秒必 flush(单条记录超预算时
+//     独立成批,此时需要 MySQL 服务端 max_allowed_packet 大于记录体积,
+//     建议 >= 64MB;PG/SQLite 无此限制)
+//   - 队列双重上限:5000 条 + 总字节预算 512MB。单条记录最大可达
+//     ~32MB(请求+响应体各 16MB 上限),体积方差大,仅靠条数无法
+//     约束内存,字节预算才是真正的内存上界。
 // 声明为 var 仅为测试可注入,运行期不会修改。
 var (
 	relayRecordChan chan *RelayRecord
 
-	relayRecordQueueSize    = 5000
-	relayRecordBatchCount   = 50
-	relayRecordBatchBytes   = 3 << 20
-	relayRecordFlushSeconds = 3
-	relayRecordStreamMaxLen = int64(10000)
+	relayRecordQueueSize     = 5000
+	relayRecordQueueMaxBytes = int64(512 << 20)
+	relayRecordBatchCount    = 50
+	relayRecordBatchBytes    = 3 << 20
+	relayRecordFlushSeconds  = 3
+	relayRecordStreamMaxLen  = int64(10000)
+
+	relayRecordQueueBytes int64 // 当前队列累计字节(atomic)
 )
 
 // InitRelayRecordConsumer 启动后台写入流水线。
@@ -120,17 +126,28 @@ func InitRelayRecordConsumer() {
 }
 
 // EnqueueRelayRecord 非阻塞入队,绝不阻塞请求路径。
-// 队列满或消费者未初始化时直接丢弃,返回 true 表示已丢弃。
+// 队列满(条数或字节预算)或消费者未初始化时直接丢弃,返回 true 表示已丢弃。
 func EnqueueRelayRecord(record *RelayRecord) (dropped bool) {
 	if relayRecordChan == nil {
+		return true
+	}
+	size := int64(relayRecordSize(record))
+	if atomic.AddInt64(&relayRecordQueueBytes, size) > relayRecordQueueMaxBytes {
+		atomic.AddInt64(&relayRecordQueueBytes, -size)
 		return true
 	}
 	select {
 	case relayRecordChan <- record:
 		return false
 	default:
+		atomic.AddInt64(&relayRecordQueueBytes, -size)
 		return true
 	}
+}
+
+// dequeueRelayRecord 在消费侧取出记录后归还字节预算。
+func dequeueRelayRecord(record *RelayRecord) {
+	atomic.AddInt64(&relayRecordQueueBytes, -int64(relayRecordSize(record)))
 }
 
 func relayRecordSize(record *RelayRecord) int {
@@ -199,6 +216,7 @@ func relayRecordMemoryConsumeLoop() {
 	for {
 		select {
 		case record := <-relayRecordChan:
+			dequeueRelayRecord(record)
 			batch = append(batch, record)
 			batchBytes += relayRecordSize(record)
 			if len(batch) >= relayRecordBatchCount || batchBytes >= relayRecordBatchBytes {
@@ -229,12 +247,14 @@ func relayRecordRedisDispatchLoop() {
 	ctx := context.Background()
 	for {
 		record := <-relayRecordChan
+		dequeueRelayRecord(record)
 		pending := []*RelayRecord{record}
 		// 非阻塞地把 channel 中已有的记录一并取出,合并为一次 pipeline
 	drain:
 		for len(pending) < relayRecordBatchCount {
 			select {
 			case r := <-relayRecordChan:
+				dequeueRelayRecord(r)
 				pending = append(pending, r)
 			default:
 				break drain

@@ -21,7 +21,7 @@ func TestEnqueueRelayRecordNilChannel(t *testing.T) {
 
 func TestEnqueueRelayRecordFullChannelNeverBlocks(t *testing.T) {
 	old := relayRecordChan
-	t.Cleanup(func() { relayRecordChan = old })
+	t.Cleanup(func() { relayRecordChan = old; relayRecordQueueBytes = 0 })
 
 	relayRecordChan = make(chan *RelayRecord, 1)
 	if dropped := EnqueueRelayRecord(&RelayRecord{}); dropped {
@@ -33,6 +33,45 @@ func TestEnqueueRelayRecordFullChannelNeverBlocks(t *testing.T) {
 	}
 	if len(relayRecordChan) != 1 {
 		t.Fatalf("queue length = %d, want 1", len(relayRecordChan))
+	}
+}
+
+// 字节预算是大记录(单条可达 ~32MB)场景下真正的内存上界:
+// 超预算必须丢弃,且丢弃/出队都要正确归还预算,不能泄漏计数。
+func TestEnqueueRelayRecordByteBudget(t *testing.T) {
+	oldChan := relayRecordChan
+	oldBudget := relayRecordQueueMaxBytes
+	t.Cleanup(func() {
+		relayRecordChan = oldChan
+		relayRecordQueueMaxBytes = oldBudget
+		relayRecordQueueBytes = 0
+	})
+
+	relayRecordChan = make(chan *RelayRecord, 100)
+	relayRecordQueueMaxBytes = 100
+	relayRecordQueueBytes = 0
+
+	big := &RelayRecord{RequestBody: strings.Repeat("a", 80)}
+	if dropped := EnqueueRelayRecord(big); dropped {
+		t.Fatal("first record within budget must enqueue")
+	}
+	// 80 + 80 > 100:超预算必须丢弃
+	if dropped := EnqueueRelayRecord(big); !dropped {
+		t.Fatal("over-budget record must drop")
+	}
+	// 丢弃后预算应已归还(仍是 80),小记录可继续入队
+	small := &RelayRecord{RequestBody: "tiny"}
+	if dropped := EnqueueRelayRecord(small); dropped {
+		t.Fatal("small record within remaining budget must enqueue")
+	}
+	// 模拟消费侧出队归还预算后,大记录又可入队
+	dequeueRelayRecord(<-relayRecordChan)
+	dequeueRelayRecord(<-relayRecordChan)
+	if relayRecordQueueBytes != 0 {
+		t.Fatalf("queue bytes leaked: %d", relayRecordQueueBytes)
+	}
+	if dropped := EnqueueRelayRecord(big); dropped {
+		t.Fatal("after dequeue, budget must be available again")
 	}
 }
 
