@@ -307,6 +307,11 @@ func InitResources() error {
 		return err
 	}
 
+	// Start relay record consumer (after LOG_DB and Redis are ready)
+	if common.GetEnvOrDefaultBool("RELAY_RECORD_ENABLED", false) {
+		model.InitRelayRecordConsumer()
+	}
+
 	perfmetrics.Init()
 
 	// 启动系统监控
